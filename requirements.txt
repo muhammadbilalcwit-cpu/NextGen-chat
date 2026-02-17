@@ -1,0 +1,35 @@
+# FastAPI + ASGI
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# WebSocket (Socket.IO - compatible with existing frontend)
+python-socketio==5.12.1
+
+# Database - PostgreSQL (async, read-only)
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+
+# Database - MongoDB (async)
+motor==3.6.0
+
+# Redis (async)
+redis[hiredis]==5.2.1
+
+# RabbitMQ (async)
+aio-pika==9.5.4
+
+# Auth
+python-jose[cryptography]==3.3.0
+
+# Encryption (AES-256-GCM at rest)
+cryptography==44.0.0
+
+# Config
+pydantic-settings==2.7.1
+
+# File upload
+python-multipart==0.0.20
+aiofiles==24.1.0
+
+# Utilities
+cryptography==44.0.0
