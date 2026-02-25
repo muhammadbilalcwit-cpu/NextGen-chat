@@ -4,6 +4,7 @@ RabbitMQ producer/consumer — queue-first message processing.
 Queues:
   chat.messages       → 1:1 message processing
   chat.group_messages → Group message processing
+  support.notifications → support queue notifications for agents
   chat.dlx / *.dlq    → Dead letter handling
 """
 import json
@@ -23,6 +24,7 @@ _connection: aio_pika.RobustConnection | None = None
 _channel: aio_pika.Channel | None = None
 _direct_handler: MessageHandler | None = None
 _group_handler: MessageHandler | None = None
+_support_handler: MessageHandler | None = None
 
 
 async def init_rabbitmq():
@@ -39,8 +41,10 @@ async def init_rabbitmq():
     # Dead letter queues
     dm_dlq = await _channel.declare_queue("chat.messages.dlq", durable=True)
     gm_dlq = await _channel.declare_queue("chat.group_messages.dlq", durable=True)
+    support_dlq = await _channel.declare_queue("support.notifications.dlq", durable=True)
     await dm_dlq.bind(dlx, routing_key="chat.messages")
     await gm_dlq.bind(dlx, routing_key="chat.group_messages")
+    await support_dlq.bind(dlx, routing_key="support.notifications")
 
     # Main queues (with DLX)
     await _channel.declare_queue(
@@ -57,6 +61,14 @@ async def init_rabbitmq():
         arguments={
             "x-dead-letter-exchange": "chat.dlx",
             "x-dead-letter-routing-key": "chat.group_messages",
+        },
+    )
+    await _channel.declare_queue(
+        "support.notifications",
+        durable=True,
+        arguments={
+            "x-dead-letter-exchange": "chat.dlx",
+            "x-dead-letter-routing-key": "support.notifications",
         },
     )
 
@@ -79,6 +91,12 @@ def set_message_handlers(
     global _direct_handler, _group_handler
     _direct_handler = direct_handler
     _group_handler = group_handler
+
+
+def set_support_notification_handler(handler: MessageHandler):
+    """Register handler for support notification queue."""
+    global _support_handler
+    _support_handler = handler
 
 
 async def publish_direct_message(payload: dict) -> None:
@@ -109,6 +127,20 @@ async def publish_group_message(payload: dict) -> None:
     )
 
 
+async def publish_support_notification(payload: dict) -> None:
+    """Publish a support notification event for agent fanout."""
+    if not _channel:
+        raise RuntimeError("RabbitMQ not connected")
+
+    await _channel.default_exchange.publish(
+        aio_pika.Message(
+            body=json.dumps(payload).encode(),
+            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+        ),
+        routing_key="support.notifications",
+    )
+
+
 async def start_consuming():
     """Start consuming messages from both queues."""
     if not _channel:
@@ -116,6 +148,7 @@ async def start_consuming():
 
     dm_queue = await _channel.get_queue("chat.messages")
     gm_queue = await _channel.get_queue("chat.group_messages")
+    support_queue = await _channel.get_queue("support.notifications")
 
     async def _process_direct(message: aio_pika.IncomingMessage):
         async with message.process():
@@ -136,5 +169,15 @@ async def start_consuming():
             except Exception as e:
                 print(f"RabbitMQ: Error processing group message: {e}")
 
+    async def _process_support(message: aio_pika.IncomingMessage):
+        async with message.process():
+            try:
+                payload = json.loads(message.body.decode())
+                if _support_handler:
+                    await _support_handler(payload)
+            except Exception as e:
+                print(f"RabbitMQ: Error processing support notification: {e}")
+
     await dm_queue.consume(_process_direct)
     await gm_queue.consume(_process_group)
+    await support_queue.consume(_process_support)

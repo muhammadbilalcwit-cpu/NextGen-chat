@@ -26,7 +26,8 @@ class Attachment(BaseModel):
 
 class Mention(BaseModel):
     userId: int
-    offset: Optional[int] = None
+    displayName: Optional[str] = None
+    position: Optional[int] = None
     length: Optional[int] = None
 
 
@@ -62,6 +63,8 @@ class MessageResponse(BaseModel):
     attachment: Optional[Attachment] = None
     mentions: List[Mention] = []
     mentionsAll: bool = False
+    isEncrypted: bool = False
+    senderIsCustomer: Optional[bool] = None
     createdAt: Optional[str] = None
     updatedAt: Optional[str] = None
 
@@ -101,6 +104,7 @@ class UnreadCountResponse(BaseModel):
     count: int
     direct: int
     groups: int
+    support: int
 
 
 class AttachmentUploadResponse(BaseModel):

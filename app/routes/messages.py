@@ -17,7 +17,7 @@ from app.schemas.message import (
     UnreadCountResponse,
 )
 from app.services import chat_service
-from app.websocket.manager import emit_to_user, emit_to_users
+from app.websocket.manager import emit_to_user, emit_to_customer, emit_to_users
 
 router = APIRouter(prefix="/chat", tags=["messages"])
 
@@ -55,9 +55,13 @@ async def mark_read(
         db = get_db()
         conv = await db.conversations.find_one({"_id": ObjectId(conversation_id)})
         if conv:
+            is_support = conv.get("isSupportChat", False)
+            support_customer_id = conv.get("supportMetadata", {}).get("customerId") if is_support else None
             other_users = [p for p in conv["participants"] if p != current_user.id]
             for uid in other_users:
-                await emit_to_user(uid, "chat:status_updated", {
+                # Use emit_to_customer for support chat customers
+                emit_fn = emit_to_customer if (is_support and uid == support_customer_id) else emit_to_user
+                await emit_fn(uid, "chat:status_updated", {
                     "conversationId": conversation_id,
                     "status": "read",
                     "messageIds": result.get("messageIds", []),
@@ -196,4 +200,4 @@ async def get_unread_count(
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """Get total unread message counts."""
-    return await chat_service.get_unread_count(current_user.id)
+    return await chat_service.get_unread_count(current_user.id, current_user.company_id)

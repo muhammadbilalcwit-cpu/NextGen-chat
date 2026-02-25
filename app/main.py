@@ -17,9 +17,8 @@ from contextlib import asynccontextmanager
 
 import socketio
 from fastapi import Depends, FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,12 +31,14 @@ from app.services.rabbitmq_service import (
     init_rabbitmq,
     close_rabbitmq,
     set_message_handlers,
+    set_support_notification_handler,
     start_consuming,
 )
 from app.websocket.gateway import (
     create_sio_server,
     process_direct_message,
     process_group_message,
+    process_support_notification,
 )
 
 # Routes
@@ -47,6 +48,8 @@ from app.routes.messages import router as messages_router
 from app.routes.groups import router as groups_router
 from app.routes.upload import router as upload_router
 from app.routes.compliance import router as compliance_router
+from app.routes.customer_auth import router as customer_auth_router
+from app.routes.support_queue import router as support_queue_router
 
 # Set up logging before anything else
 setup_logging()
@@ -115,9 +118,10 @@ async def lifespan(app: FastAPI):
         direct_handler=process_direct_message,
         group_handler=process_group_message,
     )
+    set_support_notification_handler(process_support_notification)
     _, dur, ok = await time_async(start_consuming())
     if ok:
-        logger.info(f"  {G}✓{RST} RabbitMQ Consumers {D}(direct + group, {format_duration(dur)}){RST}")
+        logger.info(f"  {G}✓{RST} RabbitMQ Consumers {D}(direct + group + support, {format_duration(dur)}){RST}")
     else:
         logger.info(f"  {R}✗{RST} RabbitMQ Consumers {D}(failed to start){RST}")
 
@@ -182,7 +186,7 @@ async def wrap_api_response(request: Request, call_next):
 
     path = request.url.path
     # Only wrap our API routes, not socket.io or static files
-    if not path.startswith("/chat") and path != "/health":
+    if not path.startswith("/chat") and not path.startswith("/customer") and path != "/health":
         return response
 
     content_type = response.headers.get("content-type", "")
@@ -218,17 +222,6 @@ async def wrap_api_response(request: Request, call_next):
         )
 
 
-# ── CORS ──
-# Registered AFTER wrap_api_response so it becomes the outermost middleware.
-# This ensures CORS headers are added to ALL responses, including those
-# where wrap_api_response creates a new Response object.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins_list,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 # ── REST Routes ──
@@ -238,6 +231,8 @@ app.include_router(messages_router)
 app.include_router(groups_router)
 app.include_router(upload_router)
 app.include_router(compliance_router)
+app.include_router(customer_auth_router)
+app.include_router(support_queue_router)
 
 # ── Static files (local uploads) ──
 if settings.STORAGE_MODE == 1:
@@ -247,6 +242,107 @@ if settings.STORAGE_MODE == 1:
 # ── Socket.IO ──
 sio = create_sio_server()
 sio_asgi = socketio.ASGIApp(sio, other_asgi_app=app)
+
+
+# ── ASGI-level CORS middleware ──
+# Wraps the ENTIRE ASGI app (including Socket.IO, Starlette's
+# ServerErrorMiddleware, etc.) so CORS headers are guaranteed on
+# every HTTP response — 200, 422, 500, unhandled crashes, everything.
+# This is the enterprise-grade approach: nothing can bypass it because
+# it is the outermost layer that uvicorn calls.
+class CORSASGIMiddleware:
+    """
+    Raw ASGI middleware that injects CORS headers into every HTTP response.
+
+    Unlike Starlette's CORSMiddleware (which lives inside the middleware
+    stack and can be bypassed by ServerErrorMiddleware), this sits at the
+    ASGI boundary itself — the very first thing uvicorn hits.
+
+    Handles:
+      - Preflight (OPTIONS) → immediate 204 with full CORS headers
+      - Normal requests     → proxies to inner app, injects headers
+      - Crashes             → returns JSON 500 with CORS headers
+    """
+
+    def __init__(self, app, allowed_origins: list[str]):
+        self.app = app
+        self.allowed_origins = set(o.lower().rstrip("/") for o in allowed_origins)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            # WebSocket / lifespan — pass through untouched
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        origin = headers.get(b"origin", b"").decode().lower().rstrip("/")
+        cors_headers = self._cors_headers(origin)
+
+        # Preflight
+        if scope["method"] == "OPTIONS" and b"access-control-request-method" in headers:
+            await self._send_preflight(send, cors_headers)
+            return
+
+        # Normal request — inject CORS headers into the response
+        headers_sent = False
+        status_code = 200
+
+        async def send_with_cors(message):
+            nonlocal headers_sent, status_code
+            if message["type"] == "http.response.start":
+                headers_sent = True
+                status_code = message.get("status", 200)
+                existing = list(message.get("headers", []))
+                existing.extend(cors_headers)
+                message = {**message, "headers": existing}
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_cors)
+        except Exception:
+            # If the inner app crashes before sending headers, return a
+            # proper JSON 500 with CORS headers so the browser can read it.
+            if not headers_sent:
+                body = b'{"detail":"Internal server error"}'
+                resp_headers = [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ] + cors_headers
+                await send({"type": "http.response.start", "status": 500, "headers": resp_headers})
+                await send({"type": "http.response.body", "body": body})
+            # Re-raise so uvicorn still logs the traceback
+            raise
+
+    def _cors_headers(self, origin: str) -> list[tuple[bytes, bytes]]:
+        """Build CORS response headers for the given origin."""
+        if origin and origin in self.allowed_origins:
+            return [
+                (b"access-control-allow-origin", origin.encode()),
+                (b"access-control-allow-credentials", b"true"),
+                (b"access-control-allow-methods", b"GET, POST, PUT, PATCH, DELETE, OPTIONS"),
+                (b"access-control-allow-headers", b"Authorization, Content-Type, X-Requested-With"),
+                (b"access-control-max-age", b"86400"),
+                (b"vary", b"Origin"),
+            ]
+        return [(b"vary", b"Origin")]
+
+    @staticmethod
+    async def _send_preflight(send, cors_headers):
+        """Respond to an OPTIONS preflight request immediately."""
+        await send({
+            "type": "http.response.start",
+            "status": 204,
+            "headers": cors_headers,
+        })
+        await send({
+            "type": "http.response.body",
+            "body": b"",
+        })
+
+
+# Wrap the entire app — this is the outermost layer uvicorn serves
+application = CORSASGIMiddleware(sio_asgi, allowed_origins=settings.cors_origins_list)
+
 
 # ── Health check ──
 @app.get("/health")
@@ -273,7 +369,3 @@ async def get_chat_config(db: AsyncSession = Depends(get_db)):
         "maxVoiceSize": settings.MAX_VOICE_SIZE,
         "chatAccessRoles": all_role_slugs,
     }
-
-
-# The ASGI app that uvicorn will serve
-application = sio_asgi

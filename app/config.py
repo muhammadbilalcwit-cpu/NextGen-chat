@@ -4,7 +4,7 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     # Service
     FASTAPI_PORT: int = 8006
-    CORS_ORIGINS: str = "http://localhost:3001"
+    CORS_ORIGINS: str = "http://localhost:3000,http://localhost:3100,http://localhost:3001"
 
     # Auth
     JWT_SECRET: str = "your-jwt-secret-here"
@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     # RabbitMQ
     RABBITMQ_URL: str = "amqp://guest:guest@localhost:5672"
 
+    # Support chat (public widget)
+    SUPPORT_VISITOR_TOKEN_EXPIRES_HOURS: int = 720  # 30 days
+    SUPPORT_AGENT_ROLE_SLUGS: str = "super_admin,company_admin,manager"
+    SUPPORT_MAX_QUEUE_PAGE_LIMIT: int = 100
+    SUPPORT_MAX_MESSAGE_PAGE_LIMIT: int = 100
+
     # Encryption (AES-256-GCM at rest)
     CHAT_ENCRYPTION_KEY: str = ""  # 64-char hex (32 bytes), generate via: python -c "import secrets; print(secrets.token_hex(32))"
 
@@ -37,7 +43,7 @@ class Settings(BaseSettings):
 
     # Attachment size limits (bytes)
     MAX_IMAGE_SIZE: int = 10_485_760      # 10MB
-    MAX_VIDEO_SIZE: int = 52_428_800      # 50MB
+    MAX_VIDEO_SIZE: int = 26_214_400      # 25MB
     MAX_DOCUMENT_SIZE: int = 26_214_400   # 25MB
     MAX_VOICE_SIZE: int = 5_242_880       # 5MB
 
@@ -72,6 +78,10 @@ class Settings(BaseSettings):
             "document": [m.strip() for m in self.ALLOWED_DOCUMENT_MIMES.split(",")],
             "voice": [m.strip() for m in self.ALLOWED_VOICE_MIMES.split(",")],
         }
+
+    @property
+    def support_agent_role_slugs(self) -> list[str]:
+        return [slug.strip().lower() for slug in self.SUPPORT_AGENT_ROLE_SLUGS.split(",") if slug.strip()]
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 

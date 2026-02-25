@@ -93,15 +93,27 @@ def _validate_response(data: dict, schema_cls):
     return schema_cls.model_validate(data).model_dump(by_alias=True)
 
 
-def _last_message_preview(content: str | None, attachment: dict | None) -> str:
-    """Build lastMessage preview text for conversation."""
+def _last_message_preview(
+    content: str | None,
+    attachment: dict | None,
+    encrypted: bool = False,
+) -> str:
+    """Build lastMessage preview text for conversation.
+
+    When ``encrypted`` is True, text content is replaced with a generic
+    indicator so that no plaintext leaks into the conversation document.
+    Attachment type labels (e.g. "Image", "Voice") are kept because they
+    contain no user content.
+    """
     if attachment:
         emoji = ATTACHMENT_EMOJI.get(attachment.get("type", ""), "")
         label = attachment.get("type", "Attachment").capitalize()
         prefix = f"{emoji} {label}"
-        if content:
+        if content and not encrypted:
             return f"{prefix}: {content}"
         return prefix
+    if encrypted:
+        return "\U0001f512 Message"
     return content or ""
 
 
@@ -115,6 +127,7 @@ async def get_or_create_conversation(user_id: int, other_user_id: int) -> dict:
     conv = await db.conversations.find_one({
         "participants": participants,
         "isGroup": {"$ne": True},
+        "isSupportChat": {"$ne": True},
     })
 
     if conv:
@@ -145,6 +158,7 @@ async def get_user_conversations(user_id: int) -> list[dict]:
     cursor = db.conversations.find({
         "participants": user_id,
         "isGroup": {"$ne": True},
+        "isSupportChat": {"$ne": True},
         "deletedFor": {"$ne": user_id},
     }).sort("lastMessageAt", -1)
 
@@ -176,6 +190,7 @@ async def save_message(
     mentions_all: bool = False,
     is_group: bool = False,
     group_members: list[int] | None = None,
+    sender_is_customer: bool | None = None,
 ) -> dict:
     """Save a new message to MongoDB and update conversation."""
     db = get_db()
@@ -197,6 +212,11 @@ async def save_message(
     # Convert conversationId to ObjectId for MongoDB
     msg["conversationId"] = _oid(conversation_id)
 
+    # Store sender role for support chats (avoids customer.id / user.id collision
+    # when determining message ownership on the frontend)
+    if sender_is_customer is not None:
+        msg["senderIsCustomer"] = sender_is_customer
+
     # Encrypt content at rest (AES-256-GCM)
     if is_encryption_enabled() and content:
         encrypted = encrypt_content(content, conversation_id)
@@ -217,7 +237,9 @@ async def save_message(
         for key in ("encryptedContent", "contentIv", "contentTag"):
             msg.pop(key, None)
 
-    # Update conversation's last message (server has plaintext, so preview is accurate)
+    # Update conversation's last message
+    # Note: lastMessage preview always uses plaintext — encryption-at-rest
+    # protects the messages collection, not the conversation preview.
     preview = _last_message_preview(content, attachment)
     await db.conversations.update_one(
         {"_id": _oid(conversation_id)},
@@ -336,8 +358,14 @@ async def mark_messages_delivered(
     conversation_id: str,
     recipient_id: int,
     is_group: bool = False,
+    recipient_is_customer: bool | None = None,
 ) -> list[str]:
-    """Mark all sent messages in conversation as delivered for recipient."""
+    """Mark all sent messages in conversation as delivered for recipient.
+
+    For support chats, pass ``recipient_is_customer`` so the query uses
+    ``senderIsCustomer`` instead of ``recipientId``, avoiding the
+    customer.id / user.id collision.
+    """
     db = get_db()
     now = _now()
 
@@ -360,11 +388,22 @@ async def mark_messages_delivered(
         return message_ids
     else:
         # 1:1: set status to delivered
-        query = {
-            "conversationId": _oid(conversation_id),
-            "recipientId": recipient_id,
-            "status": "sent",
-        }
+        if recipient_is_customer is not None:
+            # Support chat: mark messages from the OTHER role as delivered.
+            # If recipient is the customer, mark agent messages (senderIsCustomer=False).
+            # If recipient is the agent, mark customer messages (senderIsCustomer=True).
+            query = {
+                "conversationId": _oid(conversation_id),
+                "senderIsCustomer": not recipient_is_customer,
+                "status": "sent",
+            }
+        else:
+            # Regular 1:1 chat
+            query = {
+                "conversationId": _oid(conversation_id),
+                "recipientId": recipient_id,
+                "status": "sent",
+            }
         cursor = db.messages.find(query, {"_id": 1})
         message_ids = [str(msg["_id"]) async for msg in cursor]
 
@@ -380,8 +419,14 @@ async def mark_messages_read(
     conversation_id: str,
     user_id: int,
     is_group: bool = False,
+    reader_is_customer: bool | None = None,
 ) -> dict:
-    """Mark messages as read in a conversation."""
+    """Mark messages as read in a conversation.
+
+    For support chats, pass ``reader_is_customer`` so the query uses the
+    ``senderIsCustomer`` field instead of ``recipientId``.  This avoids the
+    customer.id / user.id collision where both IDs can be the same integer.
+    """
     db = get_db()
     now = _now()
 
@@ -408,11 +453,21 @@ async def mark_messages_read(
         return {"markedCount": len(message_ids), "messageIds": message_ids, "senderIds": list(sender_ids)}
     else:
         # 1:1: find IDs + senders first, then update
-        query = {
-            "conversationId": _oid(conversation_id),
-            "recipientId": user_id,
-            "status": {"$in": ["sent", "delivered"]},
-        }
+        if reader_is_customer is not None:
+            # Support chat: use senderIsCustomer to filter by role, avoiding
+            # the customer.id == user.id collision that breaks recipientId matching.
+            query = {
+                "conversationId": _oid(conversation_id),
+                "senderIsCustomer": not reader_is_customer,
+                "status": {"$in": ["sent", "delivered"]},
+            }
+        else:
+            # Regular 1:1 chat: use recipientId (no ID collision between employees)
+            query = {
+                "conversationId": _oid(conversation_id),
+                "recipientId": user_id,
+                "status": {"$in": ["sent", "delivered"]},
+            }
         cursor = db.messages.find(query, {"_id": 1, "senderId": 1})
         message_ids = []
         sender_ids = set()
@@ -523,6 +578,8 @@ async def get_pending_messages(user_id: int, company_id: int) -> list[dict]:
         "recipientId": user_id,
         "status": "sent",
         "isGroupMessage": {"$ne": True},
+        # Exclude own support-chat messages where customer.id == user.id
+        "senderIsCustomer": {"$ne": False},
     }).sort("createdAt", 1)
     async for msg in cursor:
         serialized = _decrypt_message(_serialize(msg))
@@ -566,6 +623,10 @@ async def deliver_pending_messages(user_id: int, company_id: int) -> dict:
         "recipientId": user_id,
         "status": "sent",
         "isGroupMessage": {"$ne": True},
+        # Exclude own messages in support chats where customer.id == user.id.
+        # senderIsCustomer=False means the agent sent it — skip those.
+        # For regular chat the field doesn't exist, so $ne:False still matches.
+        "senderIsCustomer": {"$ne": False},
     }
     cursor = db.messages.find(dm_query, {"_id": 1, "senderId": 1, "conversationId": 1})
     # Group by (senderId, conversationId)
@@ -627,20 +688,46 @@ async def deliver_pending_messages(user_id: int, company_id: int) -> dict:
 
 # ─── Unread Count ──────────────────────────────────────────────────────────────
 
-async def get_unread_count(user_id: int) -> dict:
+async def get_unread_count(user_id: int, company_id: int | None = None) -> dict:
     """Get total unread message counts for a user."""
     db = get_db()
     direct = 0
     groups = 0
 
+    # Find ALL support conversations where this user_id appears in participants.
+    # This catches both real support conversations (user is agent) AND collisions
+    # (customer.id matches user.id). We exclude ALL of these from the direct count.
+    all_support_conv_ids = []
+    async for conv in db.conversations.find(
+        {"participants": user_id, "isSupportChat": True}, {"_id": 1}
+    ):
+        all_support_conv_ids.append(conv["_id"])
+
+    # For the support unread badge, only count conversations for this user's company.
+    # This prevents showing another company's support unreads due to ID collision.
+    if company_id is not None:
+        own_support_conv_ids = []
+        async for conv in db.conversations.find(
+            {"participants": user_id, "isSupportChat": True, "supportMetadata.companyId": company_id},
+            {"_id": 1},
+        ):
+            own_support_conv_ids.append(conv["_id"])
+    else:
+        own_support_conv_ids = all_support_conv_ids
+
     # 1:1 unread: messages where status != 'read' and recipientId == user_id
-    direct = await db.messages.count_documents({
+    # Exclude ALL support conversations (both own-company and collision ones)
+    direct_filter: dict = {
         "recipientId": user_id,
         "senderId": {"$ne": user_id},
         "status": {"$ne": "read"},
         "isGroupMessage": {"$ne": True},
         "deletedFor": {"$ne": user_id},
-    })
+    }
+    if all_support_conv_ids:
+        direct_filter["conversationId"] = {"$nin": all_support_conv_ids}
+
+    direct = await db.messages.count_documents(direct_filter)
 
     # Group unread: messages where user not in readBy
     group_cursor = db.conversations.find({
@@ -661,14 +748,30 @@ async def get_unread_count(user_id: int) -> dict:
             query["createdAt"] = {"$gte": joined_at}
         groups += await db.messages.count_documents(query)
 
+    # Support chat unread: only count from own-company support conversations
+    support = 0
+    if own_support_conv_ids:
+        support = await db.messages.count_documents({
+            "conversationId": {"$in": own_support_conv_ids},
+            "senderIsCustomer": True,
+            "status": {"$ne": "read"},
+        })
+
     return {
-        "count": direct + groups,
+        "count": direct + groups + support,
         "direct": direct,
         "groups": groups,
+        "support": support,
     }
 
 
-async def get_conversation_unread_count(conversation_id: str, user_id: int, is_group: bool = False, member_joined_at: datetime | None = None) -> int:
+async def get_conversation_unread_count(
+    conversation_id: str,
+    user_id: int,
+    is_group: bool = False,
+    member_joined_at: datetime | None = None,
+    is_support: bool = False,
+) -> int:
     """Get unread count for a specific conversation."""
     db = get_db()
 
@@ -684,6 +787,14 @@ async def get_conversation_unread_count(conversation_id: str, user_id: int, is_g
             query["createdAt"] = {"$gte": member_joined_at}
         return await db.messages.count_documents(query)
     else:
+        if is_support:
+            # Support chat: use senderIsCustomer to avoid customer.id / user.id collision
+            return await db.messages.count_documents({
+                "conversationId": _oid(conversation_id),
+                "senderIsCustomer": True,
+                "status": {"$ne": "read"},
+                "deletedFor": {"$ne": user_id},
+            })
         return await db.messages.count_documents({
             "conversationId": _oid(conversation_id),
             "recipientId": user_id,

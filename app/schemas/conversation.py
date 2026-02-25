@@ -1,7 +1,7 @@
 """
 Conversation schemas — response models for 1:1 conversations.
 """
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -27,6 +27,10 @@ class ConversationResponse(BaseModel):
     lastMessageSystemType: Optional[str] = None
     lastMessageTargetUserId: Optional[int] = None
     lastMessageActorUserId: Optional[int] = None
+    # Support chat fields
+    isSupportChat: bool = False
+    supportStatus: Optional[str] = None
+    supportMetadata: Optional[Dict[str, Any]] = None
     createdAt: Optional[str] = None
     updatedAt: Optional[str] = None
     otherUser: Optional[ChatUser] = None

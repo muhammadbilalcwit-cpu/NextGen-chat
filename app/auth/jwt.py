@@ -1,19 +1,25 @@
 """
 JWT authentication — decodes token from cookie, validates session in PostgreSQL.
 
-Supports two JWT formats:
+Supports three JWT formats:
 
 Practice (NestJS):
   Cookie: accessToken
   { "sub": 123, "email": "u@t.com", "companyId": 1, "sessionId": 45 }
-  → sub is userId (number), load user directly
+  -> sub is userId (number), load user directly
 
 Production:
   Cookie: session_token
   { "sub": "user@company.com", "sid": "RSvCRK...", "iv": false }
-  → sid is session UUID, validate in user_sessions → get user_id → load user
+  -> sid is session UUID, validate in user_sessions -> get user_id -> load user
+
+Customer (widget):
+  Bearer token
+  { "typ": "customer", "sub": 42, "companyId": 5 }
+  -> sub is customerId, load from customers table (independent from users)
 """
 from dataclasses import dataclass
+
 from datetime import datetime, timezone
 
 from fastapi import Request, HTTPException, Depends
@@ -39,11 +45,18 @@ class CurrentUser:
     role_id: int | None = None
 
 
+@dataclass
+class CurrentCustomer:
+    """Authenticated customer data extracted from JWT + customers table."""
+    id: int
+    name: str
+    email: str
+    company_id: int
+
+
 def decode_jwt(token: str) -> dict:
     """Decode and verify JWT token."""
     try:
-        # NestJS sets sub as integer; python-jose requires string by default.
-        # Disable strict sub validation since we handle numeric sub in _resolve_user.
         payload = jwt.decode(
             token,
             settings.JWT_SECRET,
@@ -57,13 +70,11 @@ def decode_jwt(token: str) -> dict:
 
 def get_token_from_request(request: Request) -> str:
     """Extract JWT token from cookie or Authorization header."""
-    # 1. Try cookies (both practice and production names)
     token = (
         request.cookies.get(settings.COOKIE_NAME)
         or request.cookies.get("accessToken")
         or request.cookies.get("session_token")
     )
-    # Fallback: Authorization: Bearer <token>
     if not token:
         auth_header = request.headers.get("authorization", "")
         if auth_header.startswith("Bearer "):
@@ -79,11 +90,6 @@ def _is_production_format(payload: dict) -> bool:
 
 
 async def _validate_production_session(session_id: str, db: AsyncSession) -> UserSession | None:
-    """
-    Production: validate session in user_sessions table.
-    - Session exists, not expired, not revoked
-    Returns the session row (contains user_id) or None.
-    """
     result = await db.execute(
         select(UserSession).where(
             UserSession.id == str(session_id),
@@ -107,13 +113,8 @@ async def _load_user(user_id: int, db: AsyncSession) -> User | None:
 
 
 async def _resolve_user(payload: dict, db: AsyncSession) -> tuple[User, str]:
-    """
-    Resolve user from JWT payload — handles both formats.
-    Returns (user, session_id) or raises HTTPException.
-    """
+    """Resolve user from JWT payload — handles both NestJS and production formats."""
     if _is_production_format(payload):
-        # ── Production format ──
-        # sid → validate user_sessions → get user_id → load user
         session_id = payload["sid"]
         session = await _validate_production_session(session_id, db)
         if not session:
@@ -123,8 +124,6 @@ async def _resolve_user(payload: dict, db: AsyncSession) -> tuple[User, str]:
             raise HTTPException(status_code=401, detail="User not found or inactive")
         return user, str(session_id)
     else:
-        # ── Practice format ──
-        # sub is userId (number), load user directly
         user_id = payload.get("sub")
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token payload")
@@ -136,16 +135,53 @@ async def _resolve_user(payload: dict, db: AsyncSession) -> tuple[User, str]:
         return user, session_id
 
 
+async def _resolve_customer(payload: dict, db: AsyncSession) -> CurrentCustomer:
+    """Resolve customer from JWT payload. Loads from customers table (not users)."""
+    from app.models.customer import Customer
+
+    customer_id = payload.get("sub")
+    company_id = payload.get("companyId")
+    if not customer_id or not company_id:
+        raise HTTPException(status_code=401, detail="Invalid customer token payload")
+
+    result = await db.execute(
+        select(Customer).where(Customer.id == int(customer_id))
+    )
+    customer = result.scalar_one_or_none()
+    if not customer:
+        raise HTTPException(status_code=401, detail="Customer not found")
+
+    return CurrentCustomer(
+        id=customer.id,
+        name=customer.name,
+        email=customer.email,
+        company_id=customer.company_id,
+    )
+
+
 async def get_current_user(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> CurrentUser:
     """
     FastAPI dependency: extracts and validates the current user.
-    Auto-detects JWT format (practice vs production).
+    Handles customer tokens by wrapping them as CurrentUser for route compatibility.
     """
     token = get_token_from_request(request)
     payload = decode_jwt(token)
+
+    # Handle customer tokens — load from customers table
+    if payload.get("typ") == "customer":
+        cust = await _resolve_customer(payload, db)
+        return CurrentUser(
+            id=cust.id,
+            name=cust.name,
+            email=cust.email,
+            picture=None,
+            company_id=cust.company_id,
+            session_id="",
+            role_id=None,
+        )
 
     user, session_id = await _resolve_user(payload, db)
 
@@ -163,16 +199,24 @@ async def get_current_user(
     )
 
 
-async def validate_ws_token(token: str, db: AsyncSession) -> CurrentUser | None:
+async def validate_ws_token(token: str, db: AsyncSession) -> CurrentUser | CurrentCustomer | None:
     """
     Validate JWT for WebSocket connections (no FastAPI Depends).
-    Auto-detects JWT format. Returns CurrentUser or None if invalid.
+    Returns CurrentUser (agents) or CurrentCustomer (widget customers) or None.
     """
     try:
         payload = decode_jwt(token)
     except HTTPException:
         return None
 
+    # Customer token — load from customers table
+    if payload.get("typ") == "customer":
+        try:
+            return await _resolve_customer(payload, db)
+        except (HTTPException, Exception):
+            return None
+
+    # Regular user token
     try:
         user, session_id = await _resolve_user(payload, db)
     except (HTTPException, Exception):

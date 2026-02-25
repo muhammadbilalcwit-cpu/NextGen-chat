@@ -2,7 +2,8 @@
 Redis Pub/Sub for cross-server WebSocket delivery.
 
 Channels:
-  chat:deliver:{user_id}  → deliver message/event to user on another server
+  chat:deliver:{user_id}           → deliver event to employee user on another server
+  chat:deliver:customer:{cust_id}  → deliver event to customer on another server
 """
 import json
 import asyncio
@@ -10,7 +11,7 @@ from typing import Callable, Awaitable
 
 from app.redis.client import get_redis
 
-# Callback type: async fn(user_id: int, event: str, data: dict)
+# Callback type: async fn(entity_id: int, event: str, data: dict)
 DeliveryCallback = Callable[[int, str, dict], Awaitable[None]]
 
 _delivery_callback: DeliveryCallback | None = None
@@ -23,40 +24,21 @@ def set_delivery_callback(callback: DeliveryCallback) -> None:
 
 
 async def publish_to_user(user_id: int, event: str, data: dict) -> None:
-    """Publish an event to a specific user's channel (cross-server delivery)."""
+    """Publish an event to an employee user's channel (cross-server delivery)."""
     redis = get_redis()
     payload = json.dumps({"event": event, "data": data})
     await redis.publish(f"chat:deliver:{user_id}", payload)
 
 
-async def _subscriber_loop(user_ids: set[int]) -> None:
-    """Subscribe to channels for locally connected users and route events."""
+async def publish_to_customer(customer_id: int, event: str, data: dict) -> None:
+    """Publish an event to a customer's channel (cross-server delivery)."""
     redis = get_redis()
-    pubsub = redis.pubsub()
-
-    channels = [f"chat:deliver:{uid}" for uid in user_ids]
-    if channels:
-        await pubsub.subscribe(*channels)
-
-    try:
-        async for message in pubsub.listen():
-            if message["type"] != "message":
-                continue
-            channel = message["channel"]
-            # Extract user_id from channel name: "chat:deliver:42" → 42
-            user_id = int(channel.split(":")[-1])
-            payload = json.loads(message["data"])
-            if _delivery_callback:
-                await _delivery_callback(user_id, payload["event"], payload["data"])
-    except asyncio.CancelledError:
-        pass
-    finally:
-        await pubsub.unsubscribe()
-        await pubsub.close()
+    payload = json.dumps({"event": event, "data": data})
+    await redis.publish(f"chat:deliver:customer:{customer_id}", payload)
 
 
 async def subscribe_for_user(user_id: int) -> None:
-    """Subscribe to a user's delivery channel (when they connect to this server)."""
+    """Subscribe to an employee user's delivery channel (when they connect to this server)."""
     redis = get_redis()
     pubsub = redis.pubsub()
     await pubsub.subscribe(f"chat:deliver:{user_id}")
@@ -75,7 +57,30 @@ async def subscribe_for_user(user_id: int) -> None:
             await pubsub.unsubscribe()
             await pubsub.close()
 
-    # Run listener as background task
+    task = asyncio.create_task(_listen())
+    return task
+
+
+async def subscribe_for_customer(customer_id: int, callback: DeliveryCallback) -> None:
+    """Subscribe to a customer's delivery channel (when they connect to this server)."""
+    redis = get_redis()
+    pubsub = redis.pubsub()
+    await pubsub.subscribe(f"chat:deliver:customer:{customer_id}")
+
+    async def _listen():
+        try:
+            async for message in pubsub.listen():
+                if message["type"] != "message":
+                    continue
+                payload = json.loads(message["data"])
+                if callback:
+                    await callback(customer_id, payload["event"], payload["data"])
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await pubsub.unsubscribe()
+            await pubsub.close()
+
     task = asyncio.create_task(_listen())
     return task
 

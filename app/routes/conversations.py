@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.jwt import CurrentUser, get_current_user
 from app.database.postgres import get_db
 from app.models.user import User
+from app.models.customer import Customer
 from app.schemas.conversation import ConversationResponse
 from app.schemas.common import DeleteResponse
 from app.services import chat_service
@@ -23,21 +24,45 @@ async def _enrich_conversation(conv: dict, current_user: CurrentUser, db: AsyncS
     if not other_user_ids:
         return None
 
-    result = await db.execute(
-        select(User).where(User.id == other_user_ids[0])
-    )
-    other = result.scalar_one_or_none()
-    if not other:
-        return None  # Skip conversations with non-existent users
+    other_id = other_user_ids[0]
+    is_support = conv.get("isSupportChat", False)
 
-    conv["otherUser"] = {
-        "id": other.id,
-        "firstname": other.firstname,
-        "lastname": other.lastname,
-        "email": other.email,
-        "profilePicture": other.profile_picture,
-        "isOnline": await is_user_online(other.id, other.company_id),
-    }
+    if is_support:
+        # Support chat: the other participant is a customer (from customers table)
+        customer_id = conv.get("supportMetadata", {}).get("customerId")
+        if customer_id:
+            result = await db.execute(
+                select(Customer).where(Customer.id == customer_id)
+            )
+            cust = result.scalar_one_or_none()
+            if not cust:
+                return None
+            conv["otherUser"] = {
+                "id": cust.id,
+                "firstname": cust.name,
+                "lastname": "",
+                "email": cust.email,
+                "profilePicture": None,
+                "isOnline": await is_user_online(cust.id, cust.company_id),
+            }
+        else:
+            return None
+    else:
+        # Regular chat: the other participant is an employee (from users table)
+        result = await db.execute(
+            select(User).where(User.id == other_id)
+        )
+        other = result.scalar_one_or_none()
+        if not other:
+            return None
+        conv["otherUser"] = {
+            "id": other.id,
+            "firstname": other.firstname,
+            "lastname": other.lastname,
+            "email": other.email,
+            "profilePicture": other.profile_picture,
+            "isOnline": await is_user_online(other.id, other.company_id),
+        }
 
     conv["unreadCount"] = await chat_service.get_conversation_unread_count(
         conv["_id"], current_user.id, is_group=False

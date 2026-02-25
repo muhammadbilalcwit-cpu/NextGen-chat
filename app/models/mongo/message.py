@@ -13,7 +13,11 @@ Document shape:
         "contentIv": "base64...",
         "contentTag": "base64...",
         "attachment": { "type": "image", "url": "...", ... },
-        "mentions": [{ "userId": 2, "offset": 0, "length": 5 }],
+        "mentions": [{ "userId": 2, "displayName": "John", "position": 0, "length": 5 }],
+        "isEncrypted": false,
+        "encryptedContent": "base64...",
+        "contentIv": "base64...",
+        "contentTag": "base64...",
         "createdAt": datetime,
         "updatedAt": datetime,
         ...
@@ -45,7 +49,8 @@ class AttachmentSubDoc(BaseModel):
 class MentionSubDoc(BaseModel):
     """Embedded mention within a message document."""
     userId: int
-    offset: int
+    displayName: str = ""
+    position: int
     length: int
 
 
@@ -79,6 +84,10 @@ class MessageDocument(BaseModel):
     attachment: Optional[AttachmentSubDoc] = None
     mentions: List[MentionSubDoc] = []
     mentionsAll: bool = False
+    isEncrypted: bool = False
+    encryptedContent: Optional[str] = None
+    contentIv: Optional[str] = None
+    contentTag: Optional[str] = None
     createdAt: datetime
     updatedAt: datetime
 
