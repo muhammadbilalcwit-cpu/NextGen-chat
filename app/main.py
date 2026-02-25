@@ -209,17 +209,27 @@ async def wrap_api_response(request: Request, call_next):
             "status_code": response.status_code,
             "data": data,
         }, default=str)
-        return Response(
+        new_response = Response(
             content=wrapped,
             status_code=response.status_code,
             media_type="application/json",
         )
+        # Preserve Set-Cookie headers from the original response
+        # (critical for HttpOnly cookie auth in customer_auth routes)
+        for key, value in response.headers.items():
+            if key.lower() == "set-cookie":
+                new_response.headers.append(key, value)
+        return new_response
     except (json.JSONDecodeError, TypeError):
-        return Response(
+        new_response = Response(
             content=body,
             status_code=response.status_code,
             media_type=content_type,
         )
+        for key, value in response.headers.items():
+            if key.lower() == "set-cookie":
+                new_response.headers.append(key, value)
+        return new_response
 
 
 

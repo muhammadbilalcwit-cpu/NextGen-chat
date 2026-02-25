@@ -103,12 +103,16 @@ SUPPORT_AGENT_ROLE_SLUGS=super_admin,company_admin,manager
 
 ### Customer Auth (Public / Widget)
 
+Session managed via HttpOnly cookies (`customerToken`). No tokens exposed to JavaScript.
+
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/customer/check-email` | Check customer exists |
-| POST | `/customer/register` | Register customer |
-| POST | `/customer/enter-queue` | Enter support queue |
-| GET | `/customer/conversation` | Get current conversation |
+| POST | `/customer/check-email` | Check customer exists (sets HttpOnly cookie) |
+| POST | `/customer/register` | Register customer (sets HttpOnly cookie) |
+| GET | `/customer/me` | Restore session from cookie |
+| POST | `/customer/logout` | Clear session cookie |
+| POST | `/customer/enter-queue` | Enter support queue (cookie auth) |
+| GET | `/customer/conversation` | Get current conversation (cookie auth) |
 
 ### Support Queue (Agent)
 
@@ -199,7 +203,7 @@ Indexes created automatically on startup.
 - **@Mentions** — @user + @all with position-based rendering
 - **System Messages** — WhatsApp-style group event notifications
 - **Compliance** — Scoped audited access to encrypted messages
-- **Dual Auth** — Employee JWT + Customer JWT tokens
+- **Dual Auth** — Employee JWT (cookie: `accessToken`/`session_token`) + Customer JWT (HttpOnly cookie: `customerToken`)
 
 ## Related Projects
 

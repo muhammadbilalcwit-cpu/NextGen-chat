@@ -64,14 +64,17 @@ def _register_events(sio: socketio.AsyncServer):
                     token = param.split("=", 1)[1]
                     break
 
-        # Fallback: check cookies
+        # Fallback: check cookies (employee session_token or customer customerToken)
         if not token:
             cookies = environ.get("HTTP_COOKIE", "")
             from app.config import settings
-            for cookie in cookies.split(";"):
-                cookie = cookie.strip()
-                if cookie.startswith(f"{settings.COOKIE_NAME}="):
-                    token = cookie.split("=", 1)[1]
+            for cookie_name in [settings.COOKIE_NAME, "customerToken"]:
+                for cookie in cookies.split(";"):
+                    cookie = cookie.strip()
+                    if cookie.startswith(f"{cookie_name}="):
+                        token = cookie.split("=", 1)[1]
+                        break
+                if token:
                     break
 
         if not token:

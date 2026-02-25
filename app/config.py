@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     PUBLIC_URL: str = "http://localhost:8006"  # Base URL for absolute file URLs
 
     # Delete for everyone time window (hours) — like WhatsApp 48h limit
-    DELETE_FOR_EVERYONE_HOURS: float = 48
+    DELETE_FOR_EVERYONE_HOURS: float = 24
 
     # Attachment size limits (bytes)
     MAX_IMAGE_SIZE: int = 10_485_760      # 10MB

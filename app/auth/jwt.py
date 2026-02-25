@@ -74,6 +74,7 @@ def get_token_from_request(request: Request) -> str:
         request.cookies.get(settings.COOKIE_NAME)
         or request.cookies.get("accessToken")
         or request.cookies.get("session_token")
+        or request.cookies.get("customerToken")
     )
     if not token:
         auth_header = request.headers.get("authorization", "")
